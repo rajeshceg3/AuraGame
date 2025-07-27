@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <!-- VULN-004 FIX: Removed user-scalable=no to comply with WCAG accessibility standards -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AURA</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #F5F5F7;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+        #container {
+            width: 100%;
+            height: 100%;
+            cursor: pointer;
+        }
+        /* UX IMPROVEMENT: Added dynamic cursor styles */
+        .grabbing {
+            cursor: grabbing;
+        }
+    </style>
+</head>
+<body>
+    <div id="container"></div>
+
+    <!-- SECURITY IMPROVEMENT: Added Subresource Integrity (SRI) hash for the CDN link -->
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js" integrity="sha384-pqa/v+2/mS+X0i1mHwH6nBqUXq0m1v1pC2/Tn21HpOJ1cE6oI09ECgq1839CbbKR" crossorigin="anonymous"></script>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.157.0/build/three.module.js"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // --- DESIGN & GAME CONSTANTS ---
+        const COLORS = {
+            BACKGROUND: 0xF5F5F7,
+            CORE: 0xCCCCCC,
+            FRAGMENT: 0x333333,
+            DISSONANCE: 0x000000,
+            AURA: 0xFFFFFF,
+            FAIL_EMISSIVE: 0xff0000,
+        };
+
+        const PHYSICS = {
+            DAMPING: 0.98,
+            ATTRACTION: 0.05,
+            REPULSION: 0.1,
+            ORBIT_SPEED: 0.03,
+            SHATTER_IMPULSE: 2.5,
+        };
+        
+        const LEVELS = [
+            { fragments: 3, dissonance: 0, speed: 1.0 },
+            { fragments: 5, dissonance: 0, speed: 1.2 },
+            { fragments: 0, dissonance: 3, speed: 1.8 }, // VULN-005 TEST CASE
+            { fragments: 7, dissonance: 1, speed: 1.4 },
+            { fragments: 8, dissonance: 2, speed: 1.5 },
+            { fragments: 20, dissonance: 15, speed: 1.8 }, // VULN-003 STRESS TEST
+            { fragments: 1, dissonance: 8, speed: 2.5 },
+            { fragments: 12, dissonance: 5, speed: 2.2 },
+        ];
+
+        class AuraGame {
+            // Private fields for internal state
+            #currentLevel = 0;
+            #gameState = 'PLAYING';
+            #isPointerDown = false;
+            #coreFailPulse = 0;
+
+            constructor() {
+                this.container = document.getElementById('container');
+                this.scene = new THREE.Scene();
+                this.camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+                this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+                this.clock = new THREE.Clock();
+                this.pointerWorldPos = new THREE.Vector3();
+                this.raycaster = new THREE.Raycaster();
+                this.pointer = new THREE.Vector2();
+                this.interactionPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+                this.core = null;
+                this.aura = null;
+                this.fragments = [];
+                this.dissonanceObjects = [];
+                this.init();
+            }
+
+            init() {
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+                this.renderer.setClearColor(COLORS.BACKGROUND, 1);
+                this.renderer.shadowMap.enabled = true;
+                this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+                this.container.appendChild(this.renderer.domElement);
+
+                this.camera.position.set(0, 0, 20);
+
+                const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+                this.scene.add(ambientLight);
+
+                const directionalLight = new THREE.DirectionalLight(0xffffff, 1.2);
+                directionalLight.position.set(-10, 15, 20);
+                directionalLight.castShadow = true;
+                directionalLight.shadow.mapSize.width = 2048;
+                directionalLight.shadow.mapSize.height = 2048;
+                directionalLight.shadow.camera.far = 60;
+                directionalLight.shadow.camera.left = -30;
+                directionalLight.shadow.camera.right = 30;
+                directionalLight.shadow.camera.top = 30;
+                directionalLight.shadow.camera.bottom = -30;
+                this.scene.add(directionalLight);
+                
+                const shadowPlaneGeo = new THREE.PlaneGeometry(100, 100);
+                const shadowPlaneMat = new THREE.ShadowMaterial({ opacity: 0.15 });
+                const shadowPlane = new THREE.Mesh(shadowPlaneGeo, shadowPlaneMat);
+                shadowPlane.receiveShadow = true;
+                shadowPlane.position.z = -1;
+                this.scene.add(shadowPlane);
+                
+                this.#addEventListeners();
+                this.setupLevel();
+                this.animate();
+            }
+
+            // VULN-001 FIX: Dispose of GPU assets to prevent memory leaks.
+            #disposeSceneObjects() {
+                [...this.fragments, ...this.dissonanceObjects].forEach(obj => {
+                    if (obj.geometry) obj.geometry.dispose();
+                    if (obj.material) obj.material.dispose();
+                    this.scene.remove(obj);
+                });
+                this.fragments = [];
+                this.dissonanceObjects = [];
+            }
+
+            setupLevel() {
+                this.#disposeSceneObjects();
+                
+                if (!this.core) {
+                    const coreGeo = new THREE.SphereGeometry(1, 32, 32);
+                    const coreMat = new THREE.MeshStandardMaterial({ color: COLORS.CORE, roughness: 0.7, metalness: 0.1, emissive: 0x000000 });
+                    this.core = new THREE.Mesh(coreGeo, coreMat);
+                    this.core.castShadow = true;
+                    this.scene.add(this.core);
+                }
+                
+                if (!this.aura) {
+                    const auraGeo = new THREE.CircleGeometry(1, 64);
+                    const auraMat = new THREE.MeshBasicMaterial({ 
+                        map: this.#createRadialGradientTexture(),
+                        transparent: true,
+                        opacity: 0.5
+                    });
+                    this.aura = new THREE.Mesh(auraGeo, auraMat);
+                    this.aura.scale.set(0, 0, 0);
+                    this.scene.add(this.aura);
+                }
+
+                const levelConf = LEVELS[this.#currentLevel % LEVELS.length];
+                const spawnRadius = 15;
+
+                const fragmentGeo = new THREE.SphereGeometry(0.3, 24, 24);
+                for (let i = 0; i < levelConf.fragments; i++) {
+                    const fragmentMat = new THREE.MeshStandardMaterial({ color: COLORS.FRAGMENT, roughness: 0.5, metalness: 0.1 });
+                    const fragment = new THREE.Mesh(fragmentGeo, fragmentMat);
+                    fragment.castShadow = true;
+                    const angle = Math.random() * Math.PI * 2;
+                    fragment.position.set(Math.cos(angle) * (spawnRadius * (0.8 + Math.random() * 0.4)), Math.sin(angle) * (spawnRadius * (0.8 + Math.random() * 0.4)), 0);
+                    fragment.userData = { velocity: new THREE.Vector3().sub(fragment.position).normalize().multiplyScalar(levelConf.speed * (0.5 + Math.random() * 0.5)), isAttuned: false, orbitAngle: Math.random() * Math.PI * 2, orbitRadius: 0 };
+                    this.fragments.push(fragment);
+                    this.scene.add(fragment);
+                }
+
+                const dissonanceGeo = new THREE.BoxGeometry(0.7, 0.7, 0.7);
+                for (let i = 0; i < levelConf.dissonance; i++) {
+                    const dissonanceMat = new THREE.MeshStandardMaterial({ color: COLORS.DISSONANCE, roughness: 0.2, metalness: 0.0 });
+                    const dissonance = new THREE.Mesh(dissonanceGeo, dissonanceMat);
+                    dissonance.castShadow = true;
+                    const angle = Math.random() * Math.PI * 2;
+                    dissonance.position.set(Math.cos(angle) * (spawnRadius * (0.8 + Math.random() * 0.4)), Math.sin(angle) * (spawnRadius * (0.8 + Math.random() * 0.4)), 0);
+                    dissonance.userData = { velocity: new THREE.Vector3().sub(dissonance.position).normalize().multiplyScalar(levelConf.speed * (0.5 + Math.random() * 0.5)) };
+                    this.dissonanceObjects.push(dissonance);
+                    this.scene.add(dissonance);
+                }
+            }
+
+            animate() {
+                requestAnimationFrame(this.animate.bind(this));
+                const deltaTime = this.clock.getDelta();
+
+                if (this.#coreFailPulse > 0) {
+                    this.#coreFailPulse -= deltaTime;
+                    const pulseAmount = Math.sin(this.#coreFailPulse * Math.PI * 2);
+                    this.core.material.emissive.setHex(COLORS.FAIL_EMISSIVE);
+                    this.core.material.emissiveIntensity = pulseAmount > 0 ? pulseAmount : 0;
+                } else {
+                    this.core.material.emissiveIntensity = 0;
+                }
+
+                if(this.#gameState === 'PLAYING') {
+                    this.updateAura();
+                    this.updateFragments(deltaTime);
+                    this.updateDissonance(deltaTime);
+                    this.checkWinCondition();
+                } else if(this.#gameState === 'TRANSITIONING') {
+                    this.updateTransition(deltaTime);
+                }
+                this.renderer.render(this.scene, this.camera);
+            }
+
+            updateAura() {
+                if (this.#isPointerDown) {
+                    const targetScale = Math.min(this.pointerWorldPos.length(), 15);
+                    this.aura.scale.lerp(new THREE.Vector3(targetScale, targetScale, 1), 0.2);
+                    this.aura.material.opacity = THREE.MathUtils.lerp(this.aura.material.opacity, 0.5, 0.1);
+                } else {
+                    this.aura.scale.lerp(new THREE.Vector3(0, 0, 1), 0.2);
+                    this.aura.material.opacity = THREE.MathUtils.lerp(this.aura.material.opacity, 0, 0.1);
+                }
+            }
+            
+            updateFragments(deltaTime) {
+                const auraRadius = this.aura.scale.x;
+                this.fragments.forEach(frag => {
+                    if (frag.userData.isAttuned) {
+                        frag.userData.orbitAngle += (PHYSICS.ORBIT_SPEED / frag.userData.orbitRadius) * 5;
+                        const x = Math.cos(frag.userData.orbitAngle) * frag.userData.orbitRadius;
+                        const y = Math.sin(frag.userData.orbitAngle) * frag.userData.orbitRadius;
+                        frag.position.lerp(new THREE.Vector3(x, y, 0), 0.1);
+                    } else {
+                        frag.position.add(frag.userData.velocity.clone().multiplyScalar(deltaTime));
+                        frag.userData.velocity.multiplyScalar(PHYSICS.DAMPING);
+                        const distToCore = frag.position.length();
+                        if (this.#isPointerDown && distToCore < auraRadius) {
+                            const force = frag.position.clone().negate().normalize().multiplyScalar(PHYSICS.ATTRACTION);
+                            frag.userData.velocity.add(force);
+                            if (distToCore < 4 && frag.userData.velocity.length() < 0.2) {
+                                frag.userData.isAttuned = true;
+                                frag.userData.orbitRadius = distToCore;
+                                frag.material.color.set(COLORS.CORE);
+                            }
+                        }
+                    }
+                });
+            }
+
+            updateDissonance(deltaTime) {
+                const auraRadius = this.aura.scale.x;
+                const attunedFragments = this.fragments.filter(f => f.userData.isAttuned);
+
+                this.dissonanceObjects.forEach(diss => {
+                    diss.position.add(diss.userData.velocity.clone().multiplyScalar(deltaTime));
+                    diss.rotation.x += diss.userData.velocity.y * deltaTime * 0.1;
+                    diss.rotation.y += diss.userData.velocity.x * deltaTime * 0.1;
+                    diss.userData.velocity.multiplyScalar(PHYSICS.DAMPING);
+                    const distToCore = diss.position.length();
+                    
+                    if (this.#isPointerDown && distToCore < auraRadius) {
+                        const force = diss.position.clone().normalize().multiplyScalar(PHYSICS.REPULSION);
+                        diss.userData.velocity.add(force);
+                    }
+
+                    if (distToCore < 1.2) { this.shatterHarmony(); return; }
+                    
+                    // VULN-003 FIX: Optimized collision check
+                    for (const frag of attunedFragments) {
+                        // Broad-phase check: only perform expensive distance check if they are close
+                        if (Math.abs(diss.position.x - frag.position.x) < 1 && Math.abs(diss.position.y - frag.position.y) < 1) {
+                            if (diss.position.distanceTo(frag.position) < 0.8) {
+                                this.shatterHarmony();
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+
+            shatterHarmony() {
+                // VULN-006 FIX: Add visual feedback for failure.
+                this.#coreFailPulse = 0.5; // duration of pulse in seconds
+                this.fragments.forEach(frag => {
+                    if (frag.userData.isAttuned) {
+                        frag.userData.isAttuned = false;
+                        frag.material.color.set(COLORS.FRAGMENT);
+                        const shatterDir = frag.position.clone().normalize();
+                        frag.userData.velocity.add(shatterDir.multiplyScalar(PHYSICS.SHATTER_IMPULSE));
+                    }
+                });
+            }
+
+            checkWinCondition() {
+                // VULN-005 FIX: `every` correctly returns true for an empty array, making the logic robust.
+                const allFragmentsAttuned = this.fragments.every(f => f.userData.isAttuned);
+                const allDissonanceGone = this.dissonanceObjects.every(d => d.position.length() > 30);
+                
+                if (allFragmentsAttuned && allDissonanceGone) {
+                    this.#gameState = 'TRANSITIONING';
+                    this.transitionProgress = 0;
+                }
+            }
+
+            updateTransition(deltaTime) {
+                this.transitionProgress += deltaTime * 0.8;
+                this.fragments.forEach(frag => {
+                    frag.position.lerp(new THREE.Vector3(0,0,0), this.transitionProgress);
+                    const newScale = THREE.MathUtils.lerp(1, 0, this.transitionProgress);
+                    frag.scale.set(newScale, newScale, newScale);
+                });
+
+                if (this.transitionProgress >= 1) {
+                    this.#currentLevel++;
+                    this.setupLevel();
+                    this.#gameState = 'PLAYING';
+                }
+            }
+
+            #addEventListeners() {
+                window.addEventListener('resize', this.#onResize.bind(this));
+                window.addEventListener('keydown', this.#onKeyDown.bind(this));
+                this.container.addEventListener('pointerdown', this.#onPointerDown.bind(this));
+                this.container.addEventListener('pointermove', this.#onPointerMove.bind(this));
+                this.container.addEventListener('pointerup', this.#onPointerUp.bind(this));
+                this.container.addEventListener('pointerleave', this.#onPointerUp.bind(this)); // Treat leaving as pointer up
+            }
+
+            #onResize() {
+                this.camera.aspect = window.innerWidth / window.innerHeight;
+                this.camera.updateProjectionMatrix();
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            }
+            
+            #updatePointerPosition(event) {
+                this.pointer.x = (event.clientX / window.innerWidth) * 2 - 1;
+                this.pointer.y = - (event.clientY / window.innerHeight) * 2 + 1;
+                this.raycaster.setFromCamera(this.pointer, this.camera);
+                this.raycaster.ray.intersectPlane(this.interactionPlane, this.pointerWorldPos);
+            }
+
+            #onPointerDown(event) {
+                this.#isPointerDown = true;
+                this.container.classList.add('grabbing');
+                this.#updatePointerPosition(event);
+            }
+
+            #onPointerMove(event) {
+                if (this.#isPointerDown) this.#updatePointerPosition(event);
+            }
+            
+            #onPointerUp() {
+                this.#isPointerDown = false;
+                this.container.classList.remove('grabbing');
+            }
+
+            #onKeyDown(event) {
+                // UX IMPROVEMENT: Add a reset key for difficult levels
+                if (event.key === 'r' || event.key === 'R') {
+                    this.#gameState = 'PLAYING';
+                    this.setupLevel();
+                }
+            }
+
+            #createRadialGradientTexture() {
+                const canvas = document.createElement('canvas');
+                const size = 128;
+                canvas.width = size; canvas.height = size;
+                const context = canvas.getContext('2d');
+                const gradient = context.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+                gradient.addColorStop(0, 'rgba(255,255,255,1)');
+                gradient.addColorStop(1, 'rgba(255,255,255,0)');
+                context.fillStyle = gradient;
+                context.fillRect(0, 0, size, size);
+                return new THREE.CanvasTexture(canvas);
+            }
+        }
+
+        // VULN-002 FIX: Instantiate the game within the module scope, not on the global window object.
+        new AuraGame();
+    </script>
+</body>
+</html>
